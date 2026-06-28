@@ -10,8 +10,6 @@
 #include <openssl/ssl.h>
 #include <openssl/pkcs12.h>
 #include <openssl/x509.h>
-#include <openssl/pem.h>
-#include <openssl/bio.h>
 #endif
 
 #include "seafile-session.h"
@@ -50,6 +48,9 @@ typedef struct NotifServer {
     char    *path;
     int     port;
 
+#ifndef USE_GPL_CRYPTO
+    SSL_CTX *ssl_ctx;
+#endif
     gint    refcnt;
 } NotifServer;
 
@@ -264,6 +265,10 @@ notif_server_free (NotifServer *server)
         return;
     if (server->context)
         lws_context_destroy(server->context);
+#ifndef USE_GPL_CRYPTO
+    if (server->ssl_ctx)
+        SSL_CTX_free (server->ssl_ctx);
+#endif
     g_free (server->server_url);
     g_free (server->addr);
     g_free (server->path);
@@ -772,10 +777,6 @@ lws_context_new (NotifServer *server, gboolean use_ssl, const char *host)
     struct lws_context_creation_info info;
     struct lws_context *context = NULL;
     char *cert_path = NULL, *key_path = NULL, *cert_type = NULL, *password = NULL;
-#ifndef USE_GPL_CRYPTO
-    void *cert_pem = NULL, *key_pem = NULL;
-    unsigned int cert_pem_len = 0, key_pem_len = 0;
-#endif
 
     memset(&info, 0, sizeof info);
     info.port = CONTEXT_PORT_NO_LISTEN;
@@ -796,66 +797,63 @@ lws_context_new (NotifServer *server, gboolean use_ssl, const char *host)
              cert_path && cert_path[0]) {
              if (cert_type && g_ascii_strcasecmp (cert_type, "P12") == 0) {
 #ifndef USE_GPL_CRYPTO
-                 /* lws cannot load PKCS#12 from a file. Parse the bundle and
-                  * convert it to PEM in memory so lws can load it via
-                  * client_ssl_cert_mem / client_ssl_key_mem. */
-                 FILE *fp = g_fopen (cert_path, "rb");
-                 if (fp) {
-                     PKCS12 *p12 = d2i_PKCS12_fp (fp, NULL);
-                     fclose (fp);
-                     if (p12) {
-                         EVP_PKEY *pkey = NULL;
-                         X509 *x509 = NULL;
-                         STACK_OF(X509) *ca = NULL;
-                         if (PKCS12_parse (p12, password ? password : "",
-                                           &pkey, &x509, &ca)) {
-                             if (x509 && pkey) {
-                                 BIO *cbio = BIO_new (BIO_s_mem ());
-                                 BIO *kbio = BIO_new (BIO_s_mem ());
-                                 int i;
-                                 PEM_write_bio_X509 (cbio, x509);
-                                 if (ca)
-                                     for (i = 0; i < sk_X509_num (ca); i++)
-                                         PEM_write_bio_X509 (cbio,
-                                             sk_X509_value (ca, i));
-                                 PEM_write_bio_PrivateKey (kbio, pkey,
-                                     NULL, NULL, 0, NULL, NULL);
-                                 BUF_MEM *cbm = NULL, *kbm = NULL;
-                                 BIO_get_mem_ptr (cbio, &cbm);
-                                 BIO_get_mem_ptr (kbio, &kbm);
-                                 cert_pem = g_malloc (cbm->length);
-                                 memcpy (cert_pem, cbm->data, cbm->length);
-                                 cert_pem_len = (unsigned int)cbm->length;
-                                 key_pem = g_malloc (kbm->length);
-                                 memcpy (key_pem, kbm->data, kbm->length);
-                                 key_pem_len = (unsigned int)kbm->length;
-                                 BIO_free (cbio);
-                                 BIO_free (kbio);
-                                 info.client_ssl_cert_mem = cert_pem;
-                                 info.client_ssl_cert_mem_len = cert_pem_len;
-                                 info.client_ssl_key_mem = key_pem;
-                                 info.client_ssl_key_mem_len = key_pem_len;
-                                 seaf_message ("Loaded PKCS#12 client certificate "
-                                               "%s for notifications.\n", cert_path);
+                 /* lws cannot load PKCS#12 directly. Build a pre-configured
+                  * SSL_CTX with the parsed cert/key and hand it to lws via
+                  * provided_client_ssl_ctx so lws skips its own cert setup. */
+                 SSL_CTX *ssl_ctx = SSL_CTX_new (TLS_client_method ());
+                 if (ssl_ctx) {
+                     SSL_CTX_set_verify (ssl_ctx, SSL_VERIFY_PEER, NULL);
+                     if (SSL_CTX_load_verify_locations (ssl_ctx, ca_path, NULL) != 1)
+                         SSL_CTX_set_default_verify_paths (ssl_ctx);
+
+                     FILE *fp = g_fopen (cert_path, "rb");
+                     if (fp) {
+                         PKCS12 *p12 = d2i_PKCS12_fp (fp, NULL);
+                         fclose (fp);
+                         if (p12) {
+                             EVP_PKEY *pkey = NULL;
+                             X509 *x509 = NULL;
+                             STACK_OF(X509) *ca = NULL;
+                             if (PKCS12_parse (p12, password ? password : "",
+                                               &pkey, &x509, &ca)) {
+                                 if (x509 && pkey) {
+                                     int i;
+                                     SSL_CTX_use_certificate (ssl_ctx, x509);
+                                     SSL_CTX_use_PrivateKey (ssl_ctx, pkey);
+                                     if (ca)
+                                         for (i = 0; i < sk_X509_num (ca); i++) {
+                                             X509 *dup = X509_dup (sk_X509_value (ca, i));
+                                             if (dup)
+                                                 SSL_CTX_add_extra_chain_cert (ssl_ctx, dup);
+                                         }
+                                     server->ssl_ctx = ssl_ctx;
+                                     info.provided_client_ssl_ctx = ssl_ctx;
+                                     seaf_message ("Loaded PKCS#12 client certificate "
+                                                   "%s for notifications.\n", cert_path);
+                                 } else {
+                                     seaf_warning ("PKCS#12 bundle %s is missing "
+                                                   "certificate or key\n", cert_path);
+                                     SSL_CTX_free (ssl_ctx);
+                                 }
+                                 EVP_PKEY_free (pkey);
+                                 X509_free (x509);
+                                 if (ca) sk_X509_pop_free (ca, X509_free);
                              } else {
-                                 seaf_warning ("PKCS#12 bundle %s is missing "
-                                               "certificate or key\n", cert_path);
+                                 seaf_warning ("Failed to decrypt PKCS#12 bundle %s "
+                                               "(wrong password?)\n", cert_path);
+                                 SSL_CTX_free (ssl_ctx);
                              }
-                             EVP_PKEY_free (pkey);
-                             X509_free (x509);
-                             if (ca) sk_X509_pop_free (ca, X509_free);
+                             PKCS12_free (p12);
                          } else {
-                             seaf_warning ("Failed to decrypt PKCS#12 bundle %s "
-                                           "(wrong password?)\n", cert_path);
+                             seaf_warning ("Failed to parse PKCS#12 bundle %s\n",
+                                           cert_path);
+                             SSL_CTX_free (ssl_ctx);
                          }
-                         PKCS12_free (p12);
                      } else {
-                         seaf_warning ("Failed to parse PKCS#12 bundle %s\n",
-                                       cert_path);
+                         seaf_warning ("Failed to open PKCS#12 bundle %s: %s\n",
+                                       cert_path, strerror (errno));
+                         SSL_CTX_free (ssl_ctx);
                      }
-                 } else {
-                     seaf_warning ("Failed to open PKCS#12 bundle %s: %s\n",
-                                   cert_path, strerror (errno));
                  }
 #else
                  seaf_warning ("PKCS#12 client certificate is not supported for "
@@ -874,10 +872,6 @@ lws_context_new (NotifServer *server, gboolean use_ssl, const char *host)
 
     context = lws_create_context(&info);
 
-#ifndef USE_GPL_CRYPTO
-    g_free (cert_pem);
-    g_free (key_pem);
-#endif
     g_free (cert_path);
     g_free (key_path);
     g_free (cert_type);
