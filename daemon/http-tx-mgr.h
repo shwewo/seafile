@@ -115,6 +115,16 @@ http_tx_manager_new (struct _SeafileSession *seaf);
 int
 http_tx_manager_start (HttpTxManager *mgr);
 
+/*
+ * Look up the mutual-TLS client certificate to present to a server host.
+ * Returns TRUE and fills the out-params (which the caller must g_free) when a
+ * per-host or host-agnostic certificate is configured.
+ */
+gboolean
+http_tx_manager_get_client_cert (const char *host,
+                                 char **cert_path, char **key_path,
+                                 char **cert_type, char **password);
+
 int
 http_tx_manager_add_download (HttpTxManager *manager,
                               const char *repo_id,

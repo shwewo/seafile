@@ -259,6 +259,62 @@ seafile_session_init (SeafileSession *session)
 {
 }
 
+/*
+ * Load the mutual-TLS client certificate configuration.
+ *
+ * Values come from seafile.conf (the [client_ssl] style keys stored in the
+ * config db), but each can be overridden by an environment variable so the
+ * certificate can be injected without editing the on-disk config (handy for
+ * headless/test setups):
+ *
+ *   SEAFILE_CLIENT_SSL_CERT_PATH      path to PEM cert, or to the .p12 bundle
+ *   SEAFILE_CLIENT_SSL_KEY_PATH       path to PEM private key (PEM only)
+ *   SEAFILE_CLIENT_SSL_CERT_TYPE      "PEM" (default) or "P12"
+ *   SEAFILE_CLIENT_SSL_CERT_PASSWORD  key / PKCS#12 passphrase
+ */
+static char *
+client_ssl_get (SeafileSession *session, const char *key, const char *env)
+{
+    const char *env_val = g_getenv (env);
+    if (env_val && env_val[0])
+        return g_strdup (env_val);
+    return seafile_session_config_get_string (session, key);
+}
+
+static void
+load_client_ssl_cert (SeafileSession *session)
+{
+    session->client_ssl_cert_path =
+        client_ssl_get (session, KEY_CLIENT_SSL_CERT_PATH,
+                        "SEAFILE_CLIENT_SSL_CERT_PATH");
+    session->client_ssl_key_path =
+        client_ssl_get (session, KEY_CLIENT_SSL_KEY_PATH,
+                        "SEAFILE_CLIENT_SSL_KEY_PATH");
+    session->client_ssl_cert_type =
+        client_ssl_get (session, KEY_CLIENT_SSL_CERT_TYPE,
+                        "SEAFILE_CLIENT_SSL_CERT_TYPE");
+    session->client_ssl_cert_password =
+        client_ssl_get (session, KEY_CLIENT_SSL_CERT_PASSWORD,
+                        "SEAFILE_CLIENT_SSL_CERT_PASSWORD");
+
+    /* Default certificate type to PEM. */
+    if (!session->client_ssl_cert_type && session->client_ssl_cert_path)
+        session->client_ssl_cert_type = g_strdup ("PEM");
+
+    /* For PKCS#12 the private key lives inside the bundle, so a separate key
+     * path is meaningless; drop it to avoid confusing libcurl. */
+    if (session->client_ssl_cert_type &&
+        g_ascii_strcasecmp (session->client_ssl_cert_type, "P12") == 0) {
+        g_free (session->client_ssl_key_path);
+        session->client_ssl_key_path = NULL;
+    }
+
+    if (session->client_ssl_cert_path)
+        seaf_message ("Mutual TLS enabled with client certificate %s (type %s).\n",
+                      session->client_ssl_cert_path,
+                      session->client_ssl_cert_type);
+}
+
 static void
 load_system_proxy (SeafileSession *session)
 {
@@ -399,6 +455,8 @@ seafile_session_prepare (SeafileSession *session)
 
     session->disable_verify_certificate = seafile_session_config_get_bool
         (session, KEY_DISABLE_VERIFY_CERTIFICATE);
+
+    load_client_ssl_cert (session);
 
     session->use_http_proxy =
         seafile_session_config_get_bool(session, KEY_USE_PROXY);

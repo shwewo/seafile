@@ -29,6 +29,12 @@
 #define KEY_ENABLE_HTTP_SYNC "enable_http_sync"
 #define KEY_DISABLE_VERIFY_CERTIFICATE "disable_verify_certificate"
 
+/* Mutual TLS (client certificate) settings. */
+#define KEY_CLIENT_SSL_CERT_PATH "client_ssl_cert_path"
+#define KEY_CLIENT_SSL_KEY_PATH "client_ssl_key_path"
+#define KEY_CLIENT_SSL_CERT_TYPE "client_ssl_cert_type"
+#define KEY_CLIENT_SSL_CERT_PASSWORD "client_ssl_cert_password"
+
 /* Http sync proxy settings. */
 #define KEY_USE_PROXY "use_proxy"
 #define KEY_PROXY_TYPE "proxy_type"

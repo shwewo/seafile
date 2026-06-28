@@ -81,6 +81,12 @@ struct _SeafileSession {
     gboolean             enable_http_sync;
     gboolean             disable_verify_certificate;
 
+    /* Mutual TLS: client certificate presented to the server. */
+    char                *client_ssl_cert_path;
+    char                *client_ssl_key_path;
+    char                *client_ssl_cert_type;     /* "PEM" (default) or "P12" */
+    char                *client_ssl_cert_password;
+
     gboolean             disable_block_hash;
     
     gboolean             hide_windows_incompatible_path_notification;

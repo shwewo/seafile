@@ -7,6 +7,7 @@
 #include <pthread.h>
 #include <curl/curl.h>
 #include <jansson.h>
+#include <glib/gstdio.h>
 #include <event2/buffer.h>
 
 #ifdef WIN32
@@ -82,12 +83,116 @@ struct _HttpTxPriv {
     char *ca_bundle_path;
     char *env_ca_bundle_path;
 
+    /* Per-host mutual-TLS client certificates, loaded from
+     * <seaf_dir>/client-ssl-certs.json (written by the GUI). */
+    GHashTable *client_certs;          /* host (lowercase) -> ClientCert* */
+    pthread_mutex_t client_certs_lock;
+    char *client_certs_path;
+    gint64 client_certs_mtime;
+
     /* Regex to parse error message returned by update-branch. */
     GRegex *locked_error_regex;
     GRegex *folder_perm_error_regex;
     GRegex *too_many_files_error_regex;
 };
 typedef struct _HttpTxPriv HttpTxPriv;
+
+/* Per-host mutual-TLS client certificate. */
+typedef struct ClientCert {
+    char *cert_path;
+    char *key_path;
+    char *cert_type;    /* "PEM" or "P12" */
+    char *password;
+} ClientCert;
+
+static void
+client_cert_free (void *data)
+{
+    ClientCert *c = data;
+    if (!c)
+        return;
+    g_free (c->cert_path);
+    g_free (c->key_path);
+    g_free (c->cert_type);
+    g_free (c->password);
+    g_free (c);
+}
+
+/* Extract the (lowercased) host from a URL like "https://host:port/path". */
+static char *
+parse_host_from_url (const char *url)
+{
+    const char *p, *end;
+    char *host, *lower;
+
+    if (!url)
+        return NULL;
+
+    p = strstr (url, "://");
+    p = p ? p + 3 : url;
+    end = p;
+    while (*end && *end != '/' && *end != ':' && *end != '?')
+        end++;
+    if (end == p)
+        return NULL;
+
+    host = g_strndup (p, end - p);
+    lower = g_ascii_strdown (host, -1);
+    g_free (host);
+    return lower;
+}
+
+/* (Re)load the per-host certificate map if the backing file changed.
+ * Caller must hold priv->client_certs_lock. */
+static void
+reload_client_certs (HttpTxPriv *priv)
+{
+    GStatBuf st;
+    json_t *root;
+    json_error_t jerror;
+    const char *host;
+    json_t *entry;
+
+    if (g_stat (priv->client_certs_path, &st) != 0) {
+        if (g_hash_table_size (priv->client_certs) > 0)
+            g_hash_table_remove_all (priv->client_certs);
+        priv->client_certs_mtime = 0;
+        return;
+    }
+
+    if ((gint64)st.st_mtime == priv->client_certs_mtime)
+        return;
+    priv->client_certs_mtime = (gint64)st.st_mtime;
+
+    g_hash_table_remove_all (priv->client_certs);
+
+    root = json_load_file (priv->client_certs_path, 0, &jerror);
+    if (!root) {
+        seaf_warning ("Failed to parse %s: %s\n",
+                      priv->client_certs_path, jerror.text);
+        return;
+    }
+    if (!json_is_object (root)) {
+        json_decref (root);
+        return;
+    }
+
+    json_object_foreach (root, host, entry) {
+        if (!json_is_object (entry))
+            continue;
+        const char *cert_path = json_string_value (json_object_get (entry, "cert_path"));
+        if (!cert_path || cert_path[0] == 0)
+            continue;
+        ClientCert *c = g_new0 (ClientCert, 1);
+        c->cert_path = g_strdup (cert_path);
+        c->key_path = g_strdup (json_string_value (json_object_get (entry, "key_path")));
+        c->cert_type = g_strdup (json_string_value (json_object_get (entry, "cert_type")));
+        c->password = g_strdup (json_string_value (json_object_get (entry, "cert_password")));
+        g_hash_table_insert (priv->client_certs, g_ascii_strdown (host, -1), c);
+    }
+
+    json_decref (root);
+}
 
 /* Http Tx Task */
 
@@ -280,6 +385,13 @@ http_tx_manager_new (struct _SeafileSession *seaf)
 
     priv->connection_pools = g_hash_table_new (g_str_hash, g_str_equal);
     pthread_mutex_init (&priv->pools_lock, NULL);
+
+    priv->client_certs = g_hash_table_new_full (g_str_hash, g_str_equal,
+                                                g_free, client_cert_free);
+    pthread_mutex_init (&priv->client_certs_lock, NULL);
+    priv->client_certs_path = g_build_filename (seaf->seaf_dir,
+                                                "client-ssl-certs.json", NULL);
+    priv->client_certs_mtime = 0;
 
     priv->ca_bundle_path = g_build_filename (seaf->seaf_dir, "ca-bundle.pem", NULL);
 
@@ -539,6 +651,92 @@ load_ca_bundle(CURL *curl)
         curl_easy_setopt (curl, CURLOPT_CAINFO, ca_path);
 }
 #endif  /* __linux__ */
+
+/*
+ * Look up the per-host client certificate for a server host. If none is
+ * configured, *cert_path is set to NULL. The returned strings are owned by
+ * the caller and must be freed. Falls back to the host-agnostic certificate
+ * from the session config / environment (see seafile-session.c).
+ */
+gboolean
+http_tx_manager_get_client_cert (const char *host,
+                                 char **cert_path, char **key_path,
+                                 char **cert_type, char **password)
+{
+    HttpTxPriv *priv = seaf->http_tx_mgr->priv;
+    ClientCert *c;
+    char *h = host ? g_ascii_strdown (host, -1) : NULL;
+    gboolean found = FALSE;
+
+    *cert_path = *key_path = *cert_type = *password = NULL;
+
+    pthread_mutex_lock (&priv->client_certs_lock);
+    reload_client_certs (priv);
+    if (h && (c = g_hash_table_lookup (priv->client_certs, h)) != NULL) {
+        *cert_path = g_strdup (c->cert_path);
+        *key_path = g_strdup (c->key_path);
+        *cert_type = g_strdup (c->cert_type);
+        *password = g_strdup (c->password);
+        found = TRUE;
+    }
+    pthread_mutex_unlock (&priv->client_certs_lock);
+    g_free (h);
+
+    if (!found && seaf->client_ssl_cert_path) {
+        *cert_path = g_strdup (seaf->client_ssl_cert_path);
+        *key_path = g_strdup (seaf->client_ssl_key_path);
+        *cert_type = g_strdup (seaf->client_ssl_cert_type);
+        *password = g_strdup (seaf->client_ssl_cert_password);
+        found = TRUE;
+    }
+
+    return found;
+}
+
+/*
+ * Mutual TLS: present the client certificate configured for this request's
+ * server host (or the host-agnostic fallback). Supports a PEM certificate +
+ * private key, or a single PKCS#12 (.p12) bundle.
+ */
+static void
+load_client_cert (CURL *curl, const char *url)
+{
+    char *host = parse_host_from_url (url);
+    char *cert_path = NULL, *key_path = NULL, *cert_type = NULL, *password = NULL;
+
+    if (!http_tx_manager_get_client_cert (host, &cert_path, &key_path,
+                                          &cert_type, &password)) {
+        g_free (host);
+        return;
+    }
+
+    if (cert_path && cert_path[0]) {
+        if (!seaf_util_exists (cert_path)) {
+            seaf_warning ("Client TLS certificate %s does not exist, "
+                          "mutual TLS disabled for this request.\n", cert_path);
+        } else {
+            curl_easy_setopt (curl, CURLOPT_SSLCERT, cert_path);
+            if (cert_type && cert_type[0])
+                curl_easy_setopt (curl, CURLOPT_SSLCERTTYPE, cert_type);
+
+            if (key_path && key_path[0]) {
+                curl_easy_setopt (curl, CURLOPT_SSLKEY, key_path);
+                if (cert_type && cert_type[0])
+                    curl_easy_setopt (curl, CURLOPT_SSLKEYTYPE, cert_type);
+            }
+
+            /* For PEM the key passphrase; for P12 the bundle password. */
+            if (password && password[0])
+                curl_easy_setopt (curl, CURLOPT_KEYPASSWD, password);
+        }
+    }
+
+    g_free (host);
+    g_free (cert_path);
+    g_free (key_path);
+    g_free (cert_type);
+    g_free (password);
+}
 
 static gboolean
 load_certs (sqlite3_stmt *stmt, void *vdata)
@@ -817,6 +1015,8 @@ http_get (CURL *curl, const char *url, const char *token,
     load_ca_bundle (curl);
 #endif
 
+    load_client_cert (curl, url);
+
 #ifndef USE_GPL_CRYPTO
     if (!seaf->disable_verify_certificate) {
         curl_easy_setopt (curl, CURLOPT_SSL_CTX_FUNCTION, ssl_callback);
@@ -993,6 +1193,8 @@ http_put (CURL *curl, const char *url, const char *token,
     load_ca_bundle (curl);
 #endif
 
+    load_client_cert (curl, url);
+
 #ifndef USE_GPL_CRYPTO
     if (!seaf->disable_verify_certificate) {
         curl_easy_setopt (curl, CURLOPT_SSL_CTX_FUNCTION, ssl_callback);
@@ -1107,6 +1309,8 @@ http_post (CURL *curl, const char *url, const char *token,
 #ifndef USE_GPL_CRYPTO
     load_ca_bundle (curl);
 #endif
+
+    load_client_cert (curl, url);
 
 #ifndef USE_GPL_CRYPTO
     if (!seaf->disable_verify_certificate) {
