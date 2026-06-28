@@ -766,7 +766,6 @@ static const struct lws_protocols protocols[] = {
     {NULL, NULL, 0, 0, 0, NULL, 0} 
 };
 
-#ifndef USE_GPL_CRYPTO
 static struct lws_context *
 lws_context_new (NotifServer *server, gboolean use_ssl, const char *host)
 {
