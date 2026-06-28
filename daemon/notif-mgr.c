@@ -10,6 +10,8 @@
 #include <openssl/ssl.h>
 #include <openssl/pkcs12.h>
 #include <openssl/x509.h>
+#include <openssl/pem.h>
+#include <openssl/bio.h>
 #endif
 
 #include "seafile-session.h"
@@ -167,10 +169,6 @@ notif_server_ref (NotifServer *server);
 static struct lws_context *
 lws_context_new (NotifServer *server, gboolean use_ssl, const char *host);
 
-#ifndef USE_GPL_CRYPTO
-static void
-load_p12_into_ssl_ctx (SSL_CTX *ctx);
-#endif
 
 static NotifServer*
 notif_new_server (const char *server_url, gboolean use_notif_server_port)
@@ -386,15 +384,9 @@ static int
 event_callback (struct lws *wsi, enum lws_callback_reasons reason,
                 void *user, void *in, size_t len)
 {
-#ifndef USE_GPL_CRYPTO
-    /* For this callback lws passes the client SSL_CTX as 'user' (not a
-     * NotifServer), so handle it before the cast below. This lets us inject a
-     * PKCS#12 client certificate straight into the SSL_CTX in memory. */
-    if (reason == LWS_CALLBACK_OPENSSL_LOAD_EXTRA_CLIENT_VERIFY_CERTS) {
-        load_p12_into_ssl_ctx ((SSL_CTX *)user);
+    /* lws passes SSL_CTX* as 'user' for this callback, not a NotifServer. */
+    if (reason == LWS_CALLBACK_OPENSSL_LOAD_EXTRA_CLIENT_VERIFY_CERTS)
         return 0;
-    }
-#endif
 
     NotifServer *server = (NotifServer *)user;
     Message *msg = NULL;
@@ -775,100 +767,16 @@ static const struct lws_protocols protocols[] = {
 };
 
 #ifndef USE_GPL_CRYPTO
-/*
- * The PKCS#12 bundle for the context currently being created. lws creates the
- * client SSL_CTX synchronously inside lws_create_context() on this thread and
- * fires LWS_CALLBACK_OPENSSL_LOAD_EXTRA_CLIENT_VERIFY_CERTS during it, so a
- * thread-local lets the callback know which (per-host) bundle to load.
- */
-static __thread const char *tls_p12_path = NULL;
-static __thread const char *tls_p12_password = NULL;
-
-/*
- * libwebsockets' OpenSSL backend can only load a client certificate from PEM
- * files, not from a PKCS#12 bundle. To support .p12 without writing a decrypted
- * key to disk, we parse the bundle with OpenSSL and load the certificate, its
- * chain and the private key straight into the client SSL_CTX that lws hands us
- * via the LWS_CALLBACK_OPENSSL_LOAD_EXTRA_CLIENT_VERIFY_CERTS callback.
- *
- * No-op unless a PKCS#12 client certificate is configured for this context.
- */
-static void
-load_p12_into_ssl_ctx (SSL_CTX *ctx)
-{
-    const char *p12_path = tls_p12_path;
-    const char *password = tls_p12_password;
-    FILE *fp = NULL;
-    PKCS12 *p12 = NULL;
-    EVP_PKEY *pkey = NULL;
-    X509 *cert = NULL;
-    STACK_OF(X509) *ca = NULL;
-
-    if (!ctx || !p12_path)
-        return;
-
-    fp = g_fopen (p12_path, "rb");
-    if (!fp) {
-        seaf_warning ("Failed to open PKCS#12 bundle %s: %s\n",
-                      p12_path, strerror (errno));
-        return;
-    }
-    p12 = d2i_PKCS12_fp (fp, NULL);
-    fclose (fp);
-    if (!p12) {
-        seaf_warning ("Failed to parse PKCS#12 bundle %s\n", p12_path);
-        return;
-    }
-
-    if (!PKCS12_parse (p12, password ? password : "", &pkey, &cert, &ca)) {
-        seaf_warning ("Failed to decrypt PKCS#12 bundle %s (wrong password?)\n",
-                      p12_path);
-        goto out;
-    }
-    if (!pkey || !cert) {
-        seaf_warning ("PKCS#12 bundle %s is missing a certificate or key\n",
-                      p12_path);
-        goto out;
-    }
-
-    /* SSL_CTX_use_* bump the refcount, so we still own (and free) our refs. */
-    if (SSL_CTX_use_certificate (ctx, cert) != 1)
-        seaf_warning ("Failed to set client certificate from %s\n", p12_path);
-    if (SSL_CTX_use_PrivateKey (ctx, pkey) != 1)
-        seaf_warning ("Failed to set client private key from %s\n", p12_path);
-
-    /* Add any intermediate certs. add_extra_chain_cert takes ownership, so
-     * hand it a duplicate and free the originals below. */
-    if (ca) {
-        int i;
-        for (i = 0; i < sk_X509_num (ca); i++) {
-            X509 *dup = X509_dup (sk_X509_value (ca, i));
-            if (dup && SSL_CTX_add_extra_chain_cert (ctx, dup) != 1)
-                X509_free (dup);
-        }
-    }
-
-    seaf_message ("Loaded PKCS#12 client certificate %s for notifications.\n",
-                  p12_path);
-
-out:
-    if (pkey)
-        EVP_PKEY_free (pkey);
-    if (cert)
-        X509_free (cert);
-    if (ca)
-        sk_X509_pop_free (ca, X509_free);
-    if (p12)
-        PKCS12_free (p12);
-}
-#endif /* USE_GPL_CRYPTO */
-
 static struct lws_context *
 lws_context_new (NotifServer *server, gboolean use_ssl, const char *host)
 {
     struct lws_context_creation_info info;
     struct lws_context *context = NULL;
     char *cert_path = NULL, *key_path = NULL, *cert_type = NULL, *password = NULL;
+#ifndef USE_GPL_CRYPTO
+    void *cert_pem = NULL, *key_pem = NULL;
+    unsigned int cert_pem_len = 0, key_pem_len = 0;
+#endif
 
     memset(&info, 0, sizeof info);
     info.port = CONTEXT_PORT_NO_LISTEN;
@@ -888,14 +796,68 @@ lws_context_new (NotifServer *server, gboolean use_ssl, const char *host)
                                               &cert_type, &password) &&
              cert_path && cert_path[0]) {
              if (cert_type && g_ascii_strcasecmp (cert_type, "P12") == 0) {
-                 /* lws can't load PKCS#12 from a file; it is loaded into the
-                  * SSL_CTX in-memory from the
-                  * LWS_CALLBACK_OPENSSL_LOAD_EXTRA_CLIENT_VERIFY_CERTS callback
-                  * (see load_p12_into_ssl_ctx). Hand it the bundle via a
-                  * thread-local for the duration of lws_create_context(). */
 #ifndef USE_GPL_CRYPTO
-                 tls_p12_path = cert_path;
-                 tls_p12_password = password;
+                 /* lws cannot load PKCS#12 from a file. Parse the bundle and
+                  * convert it to PEM in memory so lws can load it via
+                  * client_ssl_cert_mem / client_ssl_key_mem. */
+                 FILE *fp = g_fopen (cert_path, "rb");
+                 if (fp) {
+                     PKCS12 *p12 = d2i_PKCS12_fp (fp, NULL);
+                     fclose (fp);
+                     if (p12) {
+                         EVP_PKEY *pkey = NULL;
+                         X509 *x509 = NULL;
+                         STACK_OF(X509) *ca = NULL;
+                         if (PKCS12_parse (p12, password ? password : "",
+                                           &pkey, &x509, &ca)) {
+                             if (x509 && pkey) {
+                                 BIO *cbio = BIO_new (BIO_s_mem ());
+                                 BIO *kbio = BIO_new (BIO_s_mem ());
+                                 int i;
+                                 PEM_write_bio_X509 (cbio, x509);
+                                 if (ca)
+                                     for (i = 0; i < sk_X509_num (ca); i++)
+                                         PEM_write_bio_X509 (cbio,
+                                             sk_X509_value (ca, i));
+                                 PEM_write_bio_PrivateKey (kbio, pkey,
+                                     NULL, NULL, 0, NULL, NULL);
+                                 BUF_MEM *cbm = NULL, *kbm = NULL;
+                                 BIO_get_mem_ptr (cbio, &cbm);
+                                 BIO_get_mem_ptr (kbio, &kbm);
+                                 cert_pem = g_malloc (cbm->length);
+                                 memcpy (cert_pem, cbm->data, cbm->length);
+                                 cert_pem_len = (unsigned int)cbm->length;
+                                 key_pem = g_malloc (kbm->length);
+                                 memcpy (key_pem, kbm->data, kbm->length);
+                                 key_pem_len = (unsigned int)kbm->length;
+                                 BIO_free (cbio);
+                                 BIO_free (kbio);
+                                 info.client_ssl_cert_mem = cert_pem;
+                                 info.client_ssl_cert_mem_len = cert_pem_len;
+                                 info.client_ssl_key_mem = key_pem;
+                                 info.client_ssl_key_mem_len = key_pem_len;
+                                 seaf_message ("Loaded PKCS#12 client certificate "
+                                               "%s for notifications.\n", cert_path);
+                             } else {
+                                 seaf_warning ("PKCS#12 bundle %s is missing "
+                                               "certificate or key\n", cert_path);
+                             }
+                             EVP_PKEY_free (pkey);
+                             X509_free (x509);
+                             if (ca) sk_X509_pop_free (ca, X509_free);
+                         } else {
+                             seaf_warning ("Failed to decrypt PKCS#12 bundle %s "
+                                           "(wrong password?)\n", cert_path);
+                         }
+                         PKCS12_free (p12);
+                     } else {
+                         seaf_warning ("Failed to parse PKCS#12 bundle %s\n",
+                                       cert_path);
+                     }
+                 } else {
+                     seaf_warning ("Failed to open PKCS#12 bundle %s: %s\n",
+                                   cert_path, strerror (errno));
+                 }
 #else
                  seaf_warning ("PKCS#12 client certificate is not supported for "
                                "notification websockets in this build.\n");
@@ -914,10 +876,9 @@ lws_context_new (NotifServer *server, gboolean use_ssl, const char *host)
     context = lws_create_context(&info);
 
 #ifndef USE_GPL_CRYPTO
-    tls_p12_path = NULL;
-    tls_p12_password = NULL;
+    g_free (cert_pem);
+    g_free (key_pem);
 #endif
-
     g_free (cert_path);
     g_free (key_path);
     g_free (cert_type);
