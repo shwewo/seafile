@@ -13,6 +13,7 @@
 #endif
 
 #include "seafile-session.h"
+#include "seafile-config.h"
 #include "notif-mgr.h"
 #include "sync-mgr.h"
 
@@ -47,6 +48,7 @@ typedef struct NotifServer {
     char    *addr;
     char    *path;
     int     port;
+    char    *proxy_addr;
 
 #ifndef USE_GPL_CRYPTO
     SSL_CTX *ssl_ctx;
@@ -170,6 +172,45 @@ notif_server_ref (NotifServer *server);
 static struct lws_context *
 lws_context_new (NotifServer *server, gboolean use_ssl, const char *host);
 
+static void
+set_lws_proxy (struct lws_context_creation_info *info, NotifServer *server)
+{
+    int proxy_port;
+
+    if (!seaf->use_http_proxy || !seaf->http_proxy_type || !seaf->http_proxy_addr)
+        return;
+
+    proxy_port = seaf->http_proxy_port > 0 ? seaf->http_proxy_port :
+        (g_strcmp0(seaf->http_proxy_type, PROXY_TYPE_HTTP) == 0 ? 80 : 1080);
+
+    if (seaf->http_proxy_username && seaf->http_proxy_password &&
+        g_strcmp0(seaf->http_proxy_username, "") != 0) {
+        server->proxy_addr = g_strdup_printf ("%s:%s@%s",
+                                              seaf->http_proxy_username,
+                                              seaf->http_proxy_password,
+                                              seaf->http_proxy_addr);
+    } else {
+        server->proxy_addr = g_strdup (seaf->http_proxy_addr);
+    }
+
+    if (g_strcmp0(seaf->http_proxy_type, PROXY_TYPE_HTTP) == 0) {
+        info->http_proxy_address = server->proxy_addr;
+        info->http_proxy_port = proxy_port;
+    } else if (g_strcmp0(seaf->http_proxy_type, PROXY_TYPE_SOCKS) == 0) {
+#if defined(LWS_WITH_SOCKS5)
+        info->socks_proxy_address = server->proxy_addr;
+        info->socks_proxy_port = proxy_port;
+#else
+        seaf_warning ("SOCKS proxy is not supported for the notification "
+                      "server (libwebsockets built without SOCKS5 support).\n");
+        g_free (server->proxy_addr);
+        server->proxy_addr = NULL;
+#endif
+    } else {
+        g_free (server->proxy_addr);
+        server->proxy_addr = NULL;
+    }
+}
 
 static NotifServer*
 notif_new_server (const char *server_url, gboolean use_notif_server_port)
@@ -272,6 +313,7 @@ notif_server_free (NotifServer *server)
     g_free (server->server_url);
     g_free (server->addr);
     g_free (server->path);
+    g_free (server->proxy_addr);
     if (server->subscriptions)
         g_hash_table_destroy (server->subscriptions);
 
@@ -786,6 +828,7 @@ lws_context_new (NotifServer *server, gboolean use_ssl, const char *host)
     // have to use the default allocations for fd tables up to ulimit -n.
     // It will just allocate for 1 internal and 1 (+ 1 http2 nwsi) that we will use.
     info.fd_limit_per_thread = 1 + 1 + 1;
+    set_lws_proxy (&info, server);
     char *ca_path = g_build_filename (seaf->seaf_dir, "ca-bundle.pem", NULL);
     if (use_ssl) {
          info.options = LWS_SERVER_OPTION_DO_SSL_GLOBAL_INIT;
